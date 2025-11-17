@@ -74,6 +74,7 @@ class ImproveResponse(BaseModel):
 class PredictIn(BaseModel):
     protein_id: str
     ligand: str
+    mode: Optional[Literal["heuristic", "ml", "docking"]] = "heuristic"
 
 
 class PredictOut(BaseModel):
@@ -92,7 +93,67 @@ class ImproveIn(BaseModel):
 class ImprovedMolecule(BaseModel):
     smiles: str
     score: float
+    step: int
+
+
+class TraceItem(BaseModel):
+    step: int
+    smiles: str
+    score: float
 
 
 class ImproveOut(BaseModel):
+    base_score: float
     improvements: List[ImprovedMolecule]
+    trace: List[TraceItem]
+
+
+# Protein upload response models
+class ProteinPreviewInfo(BaseModel):
+    num_atoms: int
+    num_residues: int
+
+
+class ProteinUploadResponse(BaseModel):
+    protein_id: str
+    message: str
+    preview_info: ProteinPreviewInfo
+
+
+# Batch predict models
+class BatchPredictIn(BaseModel):
+    protein_id: str
+    ligands: List[str]
+
+
+class BatchPredictItem(BaseModel):
+    ligand: str
+    score: float
+    explanation: str
+
+
+class BatchPredictOut(BaseModel):
+    results: List[BatchPredictItem]
+
+
+# Docking models
+class DockPredictIn(BaseModel):
+    protein_id: str
+    ligand: str
+
+
+class DockPredictOut(BaseModel):
+    score: float
+    affinity: Optional[float] = None
+    pose: Optional[str] = None
+
+
+# ML predict models
+class MlPredictIn(BaseModel):
+    protein_id: Optional[str] = None
+    smiles: str
+
+
+class MlPredictOut(BaseModel):
+    score: float
+    features: dict

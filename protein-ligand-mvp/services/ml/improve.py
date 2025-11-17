@@ -5,7 +5,8 @@ import itertools
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from .scoring import score_smiles
+from .scoring import score_smiles, predict
+from .mutation import add_methyl_group, halogenate, amide_lock
 
 
 def _mol_from_smiles(smiles: str) -> Chem.Mol:
@@ -132,3 +133,108 @@ def improve_until(smiles: str, target: int, max_iters: int) -> Dict:
         "best_score": int(best_score),
         "history": history,
     }
+
+
+# ------------------------------
+# New GA-style improvement API
+# ------------------------------
+
+def mutate_smiles(smiles: str) -> List[str]:
+    """Generate a small, deterministic set of mutants for a SMILES string.
+    Uses basic operators from mutation.py and internal RDKit edits for diversity.
+    """
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return []
+    cands: List[str] = []
+    # Deterministic set of mutation operators
+    for fn in (add_methyl_group, amide_lock):
+        try:
+            out = fn(smiles)
+        except Exception:
+            out = None
+        if out:
+            cands.append(out)
+    for hal in ("F", "Cl"):
+        try:
+            out = halogenate(smiles, hal)
+        except Exception:
+            out = None
+        if out:
+            cands.append(out)
+
+    # De-duplicate canonical SMILES
+    uniq = []
+    seen = set()
+    for s in cands:
+        mol = Chem.MolFromSmiles(s)
+        if mol is None:
+            continue
+        can = Chem.MolToSmiles(mol, isomericSmiles=True)
+        if can in seen:
+            continue
+        seen.add(can)
+        uniq.append(can)
+    return uniq
+
+
+def evaluate_candidates(smiles_list: List[str], protein_path: str | None = None) -> List[tuple[str, float]]:
+    """Score candidates using the existing heuristic predictor.
+    protein_path is accepted for future docking-based scoring but unused here.
+    Returns list of (smiles, score).
+    """
+    out: List[tuple[str, float]] = []
+    for s in smiles_list:
+        try:
+            res = predict(s)
+            sc = float(res.get("score", 0.0))
+            out.append((s, sc))
+        except Exception:
+            continue
+    return out
+
+
+def genetic_optimize(
+    smiles: str,
+    protein_path: str | None = None,
+    n_iters: int = 5,
+    pop_size: int = 6,
+    target_score: float | None = None,
+):
+    """Simple GA-style loop over mutations with deterministic operators.
+    Returns a dict with final sorted population and a trace of steps.
+    """
+    # Initialize population with seed and its immediate mutants
+    pop: List[str] = [smiles]
+    pop += mutate_smiles(smiles)
+    pop = list(dict.fromkeys(pop))  # stable unique
+
+    scored = evaluate_candidates(pop, protein_path)
+    scored.sort(key=lambda x: x[1], reverse=True)
+    scored = scored[:pop_size]
+    trace: List[dict] = [
+        {"step": 0, "smiles": s, "score": sc} for s, sc in scored
+    ]
+
+    for i in range(1, n_iters + 1):
+        # Mutate current population
+        new_pool: List[str] = [s for s, _ in scored]
+        for s, _ in scored:
+            new_pool.extend(mutate_smiles(s))
+        # Unique
+        new_pool = list(dict.fromkeys(new_pool))
+
+        # Score
+        new_scored = evaluate_candidates(new_pool, protein_path)
+        new_scored.sort(key=lambda x: x[1], reverse=True)
+        scored = new_scored[:pop_size]
+        for s, sc in scored:
+            trace.append({"step": i, "smiles": s, "score": sc})
+
+        # Early stop
+        if target_score is not None and any(sc >= target_score for _, sc in scored):
+            break
+
+    # Return final sorted list and trace
+    final_list = [{"smiles": s, "score": sc, "step": i} for i, (s, sc) in enumerate(scored, start=0)]
+    return {"final": final_list, "trace": trace}

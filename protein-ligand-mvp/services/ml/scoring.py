@@ -5,6 +5,8 @@ import random
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, Crippen, Lipinski, rdMolDescriptors
+from . import explain
+from .mutation import add_methyl_group, halogenate, amide_lock
 
 
 def _mol_from_smiles(smiles: str) -> Chem.Mol:
@@ -117,6 +119,7 @@ def predict(smiles: str, protein_id: str = "unknown") -> Dict[str, Any]:
     hba = Lipinski.NOCount(mol)
     rot = Lipinski.NumRotatableBonds(mol)
     mw = Descriptors.MolWt(mol)
+    tpsa = rdMolDescriptors.CalcTPSA(mol)
 
     # Heuristic scoring (deterministic and fast)
     score = 100.0
@@ -156,10 +159,20 @@ def predict(smiles: str, protein_id: str = "unknown") -> Dict[str, Any]:
         f"logP={logp:.2f}",
         f"HBD/HBA={hbd}/{hba}",
         f"RotBonds={rot}",
-        f"MW={mw:.1f}"
+        f"MW={mw:.1f}",
+        f"TPSA={tpsa:.1f}",
     ]
     if lacking:
         explanations.append("Warnings: " + "; ".join(lacking))
+
+    # Optional research recommendations
+    try:
+        props = {"logP": logp, "MW": mw, "HBD": hbd, "HBA": hba, "RotBonds": rot, "TPSA": tpsa}
+        recs = explain.research_recommendations(int(round(score)), props)
+        for r in recs[:5]:  # cap to avoid verbosity
+            explanations.append(f"Rec: {r}")
+    except Exception:
+        pass
 
     # Generate simple 3D conformer SDF for frontend viewer
     try:
@@ -176,22 +189,55 @@ def predict(smiles: str, protein_id: str = "unknown") -> Dict[str, Any]:
 
 
 def stub_improve(smiles: str, target_score: int) -> List[Dict[str, Any]]:
-    """Return 1–3 mocked improved SMILES strings with mocked scores.
-    No RDKit editing; just simple textual variations to illustrate the API.
+    """Generate simple deterministic mutants and keep those scoring >= base.
+    Returns up to 3 best unique SMILES with their scores.
     """
-    base_variants = [
-        f"{smiles}F",
-        f"{smiles}Cl",
-        f"{smiles}-Me",
-    ]
-    # Craft mock scores slightly higher than a nominal base
-    mock_scores = [89.0, 90.5, 92.0]
-    improvements: List[Dict[str, Any]] = []
-    for s, sc in zip(base_variants, mock_scores):
-        improvements.append({"smiles": s, "score": sc})
-    # Optionally trim based on target to 1–3 items
-    if target_score >= 92:
-        return improvements[:1]
-    elif target_score >= 90:
-        return improvements[:2]
-    return improvements
+    # Base score using current heuristic predictor
+    base_res = predict(smiles)
+    base_score = float(base_res.get("score", 0.0))
+
+    # Generate candidates via deterministic mutations
+    candidates: List[str] = []
+    for fn in (add_methyl_group, amide_lock):
+        try:
+            out = fn(smiles)
+        except Exception:
+            out = None
+        if out:
+            candidates.append(out)
+    # Include two halogens deterministically
+    for hal in ("F", "Cl"):
+        try:
+            out = halogenate(smiles, hal)
+        except Exception:
+            out = None
+        if out:
+            candidates.append(out)
+
+    # Deduplicate by canonical SMILES
+    uniq = []
+    seen = set()
+    for s in candidates:
+        m = Chem.MolFromSmiles(s)
+        if m is None:
+            continue
+        can = Chem.MolToSmiles(m, isomericSmiles=True)
+        if can in seen:
+            continue
+        seen.add(can)
+        uniq.append(can)
+
+    # Score and filter >= base
+    scored: List[Dict[str, Any]] = []
+    for s in uniq:
+        try:
+            res = predict(s)
+            sc = float(res.get("score", 0.0))
+            if sc >= base_score:
+                scored.append({"smiles": s, "score": sc})
+        except Exception:
+            continue
+
+    # Sort by score desc, keep up to 3
+    scored.sort(key=lambda d: d["score"], reverse=True)
+    return scored[:3]
