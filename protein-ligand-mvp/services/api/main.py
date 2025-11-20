@@ -163,7 +163,9 @@ async def upload_protein(file: UploadFile = File(...)) -> ProteinUploadResponse:
 
 @app.post("/improve", response_model=ImproveOut, summary="Stub ligand improver", tags=["improve"])
 def improve_stub(req: ImproveIn) -> ImproveOut:
-    """Deterministic improvement using mutation operators and GA-style loop."""
+    """Deterministic improvement using mutation operators and GA-style loop.
+    If optional advanced parameters are provided, runs advanced optimizer instead.
+    """
     try:
         # Base score for original ligand
         base = scoring.predict(req.ligand_smiles, protein_id=req.protein_id)
@@ -177,17 +179,110 @@ def improve_stub(req: ImproveIn) -> ImproveOut:
                 trace=[{"step": 0, "smiles": req.ligand_smiles, "score": base_score}],
             )
 
-        # Run GA-style optimization (protein_path currently unused)
-        ga = improve.genetic_optimize(
-            req.ligand_smiles,
-            protein_path=None,
-            n_iters=5,
-            pop_size=6,
-            target_score=float(req.target_score) if req.target_score is not None else None,
-        )
-        final = ga.get("final", [])
-        trace = ga.get("trace", [])
-        improvements = [ImprovedMolecule(smiles=it["smiles"], score=float(it["score"]), step=int(it.get("step", 0))) for it in final]
-        return ImproveOut(base_score=base_score, improvements=improvements, trace=[{"step": int(t.get("step", 0)), "smiles": t["smiles"], "score": float(t["score"]) } for t in trace])
+        # Choose optimizer: advanced if optional params present, else legacy GA
+        use_advanced = any([
+            req.mode is not None,
+            req.n_iters is not None,
+            req.pop_size is not None,
+            req.mutate_rate is not None,
+            bool(req.persist_debug),
+        ])
+
+        if use_advanced:
+            # Resolve protein path if docking selected
+            protein_path = None
+            if (req.mode or "").lower() == "docking":
+                p = Path("data") / "proteins" / f"{req.protein_id}.pdb"
+                protein_path = str(p) if p.exists() else None
+
+            dbg_dir = None
+            if req.persist_debug:
+                dbg_dir = str(Path("data") / "improve_debug")
+
+            # Quick mode heuristic: if caller provided a custom size box, enable quick
+            quick = False
+            if (req.mode or "").lower() == "docking" and req.size:
+                try:
+                    # any indication of smaller-than-default box enables quick path
+                    sx, sy, sz = [float(x) for x in req.size]
+                    quick = any(v < 30.0 for v in (sx, sy, sz))
+                except Exception:
+                    quick = True
+
+            ga = improve.advanced_genetic_optimize(
+                seed_smiles=req.ligand_smiles,
+                protein_path=protein_path,
+                mode=(req.mode or "heuristic"),
+                n_iters=int(req.n_iters) if req.n_iters is not None else 8,
+                pop_size=int(req.pop_size) if req.pop_size is not None else 8,
+                mutate_rate=float(req.mutate_rate) if req.mutate_rate is not None else 0.5,
+                target_score=float(req.target_score) if req.target_score is not None else None,
+                persist_debug_dir=dbg_dir,
+                quick=quick,
+            )
+            final = ga.get("final", [])
+            trace = ga.get("trace", [])
+            improvements = []
+            for it in final:
+                meta = {
+                    "mode": (req.mode or "heuristic"),
+                    "protein_id": req.protein_id,
+                    "quick": bool(quick),
+                    "op_name": it.get("op_name"),
+                    "parent_smiles": it.get("parent_smiles"),
+                }
+                expl = []
+                if (req.mode or "").lower() == "docking":
+                    expl.append(f"docking_affinity={it['score']}")
+                improvements.append(
+                    ImprovedMolecule(
+                        smiles=it["smiles"],
+                        score=float(it["score"]),
+                        step=int(it.get("step", 0)),
+                        op_name=str(it.get("op_name")) if it.get("op_name") is not None else None,
+                        parent_smiles=str(it.get("parent_smiles")) if it.get("parent_smiles") is not None else None,
+                        explanations=expl or None,
+                        metadata=meta,
+                    )
+                )
+            return ImproveOut(
+                base_score=ga.get("base_score", base_score),
+                improvements=improvements,
+                trace=[{"step": int(t.get("step", 0)), "smiles": t["smiles"], "score": float(t["score"]) } for t in trace],
+                run_metadata={
+                    "mode": (req.mode or "heuristic"),
+                    "protein_id": req.protein_id,
+                    "n_iters": int(req.n_iters) if req.n_iters is not None else 8,
+                    "pop_size": int(req.pop_size) if req.pop_size is not None else 8,
+                    "mutate_rate": float(req.mutate_rate) if req.mutate_rate is not None else 0.5,
+                    "quick": bool(quick),
+                },
+            )
+        else:
+            # Legacy GA-style optimization
+            ga = improve.genetic_optimize(
+                req.ligand_smiles,
+                protein_path=None,
+                n_iters=5,
+                pop_size=6,
+                target_score=float(req.target_score) if req.target_score is not None else None,
+            )
+            final = ga.get("final", [])
+            trace = ga.get("trace", [])
+            improvements = [
+                ImprovedMolecule(
+                    smiles=it["smiles"],
+                    score=float(it["score"]),
+                    step=int(it.get("step", 0)),
+                    explanations=[f"heuristic_score={float(it['score']):.1f}"],
+                    metadata={"mode": "heuristic", "protein_id": req.protein_id},
+                ) for it in final
+            ]
+            return ImproveOut(
+                base_score=base_score,
+                improvements=improvements,
+                trace=[{"step": int(t.get("step", 0)), "smiles": t["smiles"], "score": float(t["score"]) } for t in trace],
+                run_metadata={"mode": "heuristic", "protein_id": req.protein_id},
+            )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -88,12 +88,25 @@ class ImproveIn(BaseModel):
     protein_id: str
     ligand_smiles: str
     target_score: int
+    # Optional advanced tuning (backwards compatible defaults)
+    mode: Optional[Literal["heuristic", "docking", "ml"]] = None
+    n_iters: Optional[int] = None
+    pop_size: Optional[int] = None
+    mutate_rate: Optional[float] = None
+    persist_debug: Optional[bool] = False
+    # Docking overrides (not required; may be ignored if mode != docking)
+    center: Optional[List[float]] = None  # [cx, cy, cz]
+    size: Optional[List[float]] = None    # [sx, sy, sz]
 
 
 class ImprovedMolecule(BaseModel):
     smiles: str
     score: float
     step: int
+    op_name: Optional[str] = None
+    parent_smiles: Optional[str] = None
+    explanations: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class TraceItem(BaseModel):
@@ -106,6 +119,7 @@ class ImproveOut(BaseModel):
     base_score: float
     improvements: List[ImprovedMolecule]
     trace: List[TraceItem]
+    run_metadata: Optional[Dict[str, Any]] = None
 
 
 # Protein upload response models

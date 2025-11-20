@@ -4,9 +4,18 @@ import itertools
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem import rdMolDescriptors, DataStructs
 
 from .scoring import score_smiles, predict
 from .mutation import add_methyl_group, halogenate, amide_lock
+from .mutation import generate_mutants
+from . import docking as _docking
+from . import model as _mlmodel
+import logging
+import os
+from pathlib import Path
+
+log = logging.getLogger("improve")
 
 
 def _mol_from_smiles(smiles: str) -> Chem.Mol:
@@ -136,6 +145,205 @@ def improve_until(smiles: str, target: int, max_iters: int) -> Dict:
 
 
 # ------------------------------
+# New advanced, additive API (does not alter existing functions)
+# ------------------------------
+
+def _inchikey_of(smiles: str) -> str | None:
+    try:
+        from rdkit.Chem.inchi import MolToInchiKey
+        m = Chem.MolFromSmiles(smiles)
+        if not m:
+            return None
+        return MolToInchiKey(m)
+    except Exception:
+        return None
+
+
+def _ecfp4(smiles: str):
+    m = Chem.MolFromSmiles(smiles)
+    if not m:
+        return None
+    return rdMolDescriptors.GetMorganFingerprintAsBitVect(m, 2, nBits=2048)
+
+
+def _tanimoto(a_fp, b_fp) -> float:
+    if a_fp is None or b_fp is None:
+        return 0.0
+    return float(DataStructs.TanimotoSimilarity(a_fp, b_fp))
+
+
+def score_for_improvement(smiles: str, protein_path: str | None = None, mode: str = "heuristic", quick: bool = False) -> dict:
+    """Unified scoring wrapper.
+    mode: heuristic | docking | ml
+    Returns {score: float, detail: dict}
+    """
+    mode = (mode or "heuristic").lower()
+    # Heuristic fast path
+    if mode == "heuristic" or (mode == "docking" and not protein_path):
+        res = predict(smiles)
+        return {"score": float(res.get("score", 0.0)), "detail": {"calibration": res.get("calibration_info")}}
+    if mode == "ml":
+        try:
+            mres = _mlmodel.score_smiles(smiles)
+            return {"score": float(mres.get("score", 0.0)), "detail": {"features": mres.get("features", {})}}
+        except Exception as e:
+            log.warning("ml scoring failed; fallback to heuristic: %s", e)
+            res = predict(smiles)
+            return {"score": float(res.get("score", 0.0)), "detail": {"fallback": "heuristic"}}
+    # Docking path: return raw affinity as score; if no affinity, raise to let caller discard
+    try:
+        dres = _docking.dock(smiles, protein_path, quick=quick)
+        aff = dres.get("affinity")
+        if aff is None:
+            raise ValueError("docking produced no affinity")
+        return {"score": float(aff), "detail": {"affinity": aff}}
+    except Exception as e:
+        raise
+
+
+def _select_diverse(scored: list[dict], pop_size: int, tanimoto_threshold: float = 0.95) -> list[dict]:
+    """Keep top-k with diversity by Tanimoto on ECFP4."""
+    kept: list[dict] = []
+    fps: list = []
+    for item in scored:
+        fp = _ecfp4(item["smiles"])  # may be None
+        ok = True
+        for f2 in fps:
+            if _tanimoto(fp, f2) >= tanimoto_threshold:
+                ok = False
+                break
+        if ok:
+            kept.append(item)
+            fps.append(fp)
+        if len(kept) >= pop_size:
+            break
+    # If not enough, relax threshold
+    if len(kept) < pop_size:
+        for item in scored:
+            if item in kept:
+                continue
+            kept.append(item)
+            if len(kept) >= pop_size:
+                break
+    return kept
+
+
+def advanced_genetic_optimize(
+    seed_smiles: str,
+    protein_path: str | None = None,
+    mode: str = "heuristic",
+    n_iters: int = 8,
+    pop_size: int = 8,
+    mutate_rate: float = 0.5,
+    target_score: float | None = None,
+    persist_debug_dir: str | None = None,
+    quick: bool = False,
+) -> dict:
+    """Advanced GA with diversity and optional docking/ML scoring. Additive API.
+    Returns {base_score, final:[{smiles,score,step,op_name,parent_smiles}], trace:[...]}.
+    """
+    # Debug directory
+    dbg_dir = None
+    if persist_debug_dir:
+        dbg_dir = Path(persist_debug_dir)
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+
+    # Base scoring
+    # Base score; if docking mode and no affinity, base_score omitted (use 0.0)
+    try:
+        base_res = score_for_improvement(seed_smiles, protein_path, mode, quick=quick)
+        base_score = float(base_res["score"])
+    except Exception:
+        base_score = 0.0
+
+    # Seed population
+    pop = [(seed_smiles, "seed", None)]  # (smiles, op_name, parent)
+    for s, op in generate_mutants(seed_smiles, n_per_operator=2):
+        pop.append((s, op, seed_smiles))
+
+    # Seen set by InChIKey
+    seen_keys = set()
+    def _key(s: str) -> str:
+        return _inchikey_of(s) or s
+
+    # Score and select initial
+    scored: list[dict] = []
+    for s, op, parent in pop:
+        k = _key(s)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        try:
+            sc = score_for_improvement(s, protein_path, mode, quick=quick)
+        except Exception:
+            continue
+        scored.append({"smiles": s, "score": sc["score"], "op_name": op, "parent_smiles": parent, "step": 0})
+    # Determine sort direction based on scoring mode
+    dock_mode = (mode.lower() == "docking" and bool(protein_path))
+    scored.sort(key=lambda d: d["score"], reverse=not dock_mode)
+    current = _select_diverse(scored, pop_size)
+
+    trace = [{"step": 0, "smiles": it["smiles"], "score": it["score"]} for it in current]
+
+    # GA iterations
+    import random as _r
+    for it in range(1, n_iters + 1):
+        # Mutate current with given rate
+        new_candidates: list[tuple[str, str, str]] = []
+        for item in current:
+            s = item["smiles"]
+            # Always keep parent in pool
+            new_candidates.append((s, item.get("op_name") or "carry", item.get("parent_smiles") or None))
+            if _r.random() <= mutate_rate:
+                muts = generate_mutants(s, n_per_operator=1)
+                for ms, op in muts:
+                    new_candidates.append((ms, op, s))
+
+        # Score all new candidates
+        round_scored: list[dict] = []
+        for s, op, parent in new_candidates:
+            k = _key(s)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            try:
+                sc = score_for_improvement(s, protein_path, mode, quick=quick)
+            except Exception:
+                continue
+            round_scored.append({"smiles": s, "score": sc["score"], "op_name": op, "parent_smiles": parent, "step": it})
+
+        # Merge with current and select
+        merged = current + round_scored
+        merged.sort(key=lambda d: d["score"], reverse=not dock_mode)
+        current = _select_diverse(merged, pop_size)
+
+        trace.extend({"step": it, "smiles": it2["smiles"], "score": it2["score"]} for it2 in current)
+
+        # optional early stop check (collect near-hits in this iteration anyway)
+        if target_score is not None:
+            if dock_mode and any(x["score"] <= target_score for x in current):
+                break
+            if (not dock_mode) and any(x["score"] >= target_score for x in current):
+                # we still finish this iteration as above
+                break
+
+    # persist debug if requested
+    if dbg_dir is not None:
+        try:
+            import csv
+            with open(dbg_dir / "trace.csv", "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=["step", "smiles", "score"]) 
+                w.writeheader(); w.writerows(trace)
+        except Exception:
+            pass
+
+    # Final list sorted
+    final = sorted(current, key=lambda d: d["score"], reverse=not dock_mode)
+    return {"base_score": base_score, "final": final, "trace": trace}
+
+
+
+# ------------------------------
 # New GA-style improvement API
 # ------------------------------
 
@@ -178,17 +386,25 @@ def mutate_smiles(smiles: str) -> List[str]:
     return uniq
 
 
-def evaluate_candidates(smiles_list: List[str], protein_path: str | None = None) -> List[tuple[str, float]]:
-    """Score candidates using the existing heuristic predictor.
-    protein_path is accepted for future docking-based scoring but unused here.
+def evaluate_candidates(smiles_list: List[str], protein_path: str | None = None, quick: bool = False) -> List[tuple[str, float]]:
+    """Score candidates.
+    - If protein_path is provided: use docking and take raw affinity as the score; discard if no affinity.
+    - Else: fallback to heuristic predictor score.
     Returns list of (smiles, score).
     """
     out: List[tuple[str, float]] = []
     for s in smiles_list:
         try:
-            res = predict(s)
-            sc = float(res.get("score", 0.0))
-            out.append((s, sc))
+            if protein_path:
+                dres = _docking.dock(s, protein_path, quick=quick)
+                aff = dres.get("affinity")
+                if aff is None:
+                    continue
+                out.append((s, float(aff)))
+            else:
+                res = predict(s)
+                sc = float(res.get("score", 0.0))
+                out.append((s, sc))
         except Exception:
             continue
     return out
@@ -200,6 +416,7 @@ def genetic_optimize(
     n_iters: int = 5,
     pop_size: int = 6,
     target_score: float | None = None,
+    quick: bool = False,
 ):
     """Simple GA-style loop over mutations with deterministic operators.
     Returns a dict with final sorted population and a trace of steps.
@@ -209,8 +426,9 @@ def genetic_optimize(
     pop += mutate_smiles(smiles)
     pop = list(dict.fromkeys(pop))  # stable unique
 
-    scored = evaluate_candidates(pop, protein_path)
-    scored.sort(key=lambda x: x[1], reverse=True)
+    scored = evaluate_candidates(pop, protein_path, quick=quick)
+    dock_mode = bool(protein_path)
+    scored.sort(key=lambda x: x[1], reverse=not dock_mode)
     scored = scored[:pop_size]
     trace: List[dict] = [
         {"step": 0, "smiles": s, "score": sc} for s, sc in scored
@@ -225,15 +443,18 @@ def genetic_optimize(
         new_pool = list(dict.fromkeys(new_pool))
 
         # Score
-        new_scored = evaluate_candidates(new_pool, protein_path)
-        new_scored.sort(key=lambda x: x[1], reverse=True)
+        new_scored = evaluate_candidates(new_pool, protein_path, quick=quick)
+        new_scored.sort(key=lambda x: x[1], reverse=not dock_mode)
         scored = new_scored[:pop_size]
         for s, sc in scored:
             trace.append({"step": i, "smiles": s, "score": sc})
 
         # Early stop
-        if target_score is not None and any(sc >= target_score for _, sc in scored):
-            break
+        if target_score is not None:
+            if dock_mode and any(sc <= target_score for _, sc in scored):
+                break
+            if (not dock_mode) and any(sc >= target_score for _, sc in scored):
+                break
 
     # Return final sorted list and trace
     final_list = [{"smiles": s, "score": sc, "step": i} for i, (s, sc) in enumerate(scored, start=0)]
