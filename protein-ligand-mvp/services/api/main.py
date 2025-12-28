@@ -3,7 +3,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-from .schemas import (
+from services.api.schemas import (
     PredictRequest,
     PredictResponse,
     Interaction,
@@ -22,14 +22,14 @@ from .schemas import (
     DockPredictIn,
     DockPredictOut,
 )
-from .utils import smiles_from_input
+from services.api.utils import smiles_from_input
 from pathlib import Path
 import uuid as _uuid
-from .utils import ensure_dir, parse_pdb_preview, write_bytes
-from ..ml import scoring, explain
-from ..ml import docking
-from ..ml import model as ml_model
-from ..ml import improve
+from services.api.utils import ensure_dir, parse_pdb_preview, write_bytes
+from services.ml import scoring, explain
+from services.ml import docking
+from services.ml import model as ml_model
+from services.ml import improve
 
 import os, shutil
 print("DEBUG VINA_BIN:", os.getenv("VINA_BIN"))

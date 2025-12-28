@@ -1,0 +1,5 @@
+ligand_id,num_atoms,runtime_seconds
+lig1,25,1.23
+lig2,32,1.95
+lig3,45,3.10
+lig4,60,4.85

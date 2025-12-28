@@ -1,0 +1,5 @@
+method,vina_score
+baseline_ligand,-7.8
+heuristic_optimization,-8.5
+ml_ligand_generation,-9.1
+manual_docking_control,-8.0
