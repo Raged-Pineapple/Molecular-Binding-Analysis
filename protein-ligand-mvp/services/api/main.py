@@ -75,13 +75,16 @@ def predict(req: PredictIn) -> PredictOut:
                 viewer_payload=None,
             )
         else:
-            # default heuristic
-            res = scoring.predict(req.ligand, protein_id=req.protein_id)
+            # default heuristic -> now calls analyze_compatibility
+            res = scoring.analyze_compatibility(req.ligand, protein_id=req.protein_id)
             return PredictOut(
                 score=float(res["score"]),
-                calibration_info=str(res["calibration_info"]),
-                explanations=[str(x) for x in res.get("explanations", [])],
-                viewer_payload=res.get("viewer_payload"),
+                calibration_info="compatibility-v1",
+                explanations=res["explanations"],
+                viewer_payload=None, # Explicitly no 3D for Scoring tab
+                binding_score=res["binding_score"],
+                ligand_properties=res["ligand_properties"],
+                recommendations=res["recommendations"],
             )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -284,5 +287,6 @@ def improve_stub(req: ImproveIn) -> ImproveOut:
                 trace=[{"step": int(t.get("step", 0)), "smiles": t["smiles"], "score": float(t["score"]) } for t in trace],
                 run_metadata={"mode": "heuristic", "protein_id": req.protein_id},
             )
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

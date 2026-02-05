@@ -1,0 +1,9 @@
+{
+  "base_score": 0.0,
+  "improvements": [],
+  "trace": [],
+  "run_metadata": {
+    "mode": "heuristic",
+    "protein_id": "0c326d7b-6744-4aad-96ae-42b66e508c9b"
+  }
+}

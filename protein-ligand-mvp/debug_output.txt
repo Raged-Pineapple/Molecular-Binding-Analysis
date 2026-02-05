@@ -1,0 +1,25 @@
+{
+  "obabel_path": "D:\\micromamba\\envs\\plmvp\\Library\\bin\\obabel.EXE",
+  "scoring_result": {
+    "binding_score": 38.3,
+    "score": 38.3,
+    "explanations": [
+      "Weak interaction profile; docking suggests poor pocket occupancy",
+      "Ligand size below optimal pocket occupancy"
+    ],
+    "ligand_properties": {
+      "logP": -0.0,
+      "MW": 46.1,
+      "TPSA": 20.2,
+      "HBD": 1,
+      "HBA": 1
+    },
+    "recommendations": [
+      "Consider increasing MW above 200 if potency is limited by size",
+      "Add hydrophobic moieties to increase logP and strengthen hydrophobic contacts",
+      "Add H-bond acceptors to improve specific interactions and solubility",
+      "Introduce limited flexibility to allow conformational adaptation in the pocket",
+      "Increase TPSA (>40 \u00c5\u00b2) to aid solubility and specific interactions"
+    ]
+  }
+}

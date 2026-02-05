@@ -33,26 +33,6 @@ except Exception:
 st.title("Dashboard")
 
 # ----------------------
-# Session login (local only)
-# ----------------------
-if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None
-
-with st.sidebar:
-    st.header("Session")
-    if st.session_state["auth_user"]:
-        st.success(f"Logged in as {st.session_state['auth_user']}")
-        if st.button("Logout"):
-            st.session_state["auth_user"] = None
-    else:
-        user = st.text_input("Username", key="login_user")
-        if st.button("Login"):
-            if user.strip():
-                st.session_state["auth_user"] = user.strip()
-            else:
-                st.warning("Enter a username to start a session")
-
-# ----------------------
 # Backend config + health check
 # ----------------------
 
@@ -201,23 +181,40 @@ with scoring_tab:
         protein_id = st.text_input("Protein ID", value="1ABC", key="dash_score_pid")
         ligand = st.text_input("Ligand SMILES", value="CCO", key="dash_score_smi")
     with col2:
-        mode = st.selectbox("Mode", ["heuristic", "ml"], index=0, key="dash_score_mode")
+        mode = st.selectbox("Mode", ["heuristic"], index=0, key="dash_score_mode")
         style = st.selectbox("Viewer style", ["stick", "cartoon", "surface"], index=0)
     if st.button("Score", type="primary", key="dash_score_btn"):
         payload = {"protein_id": protein_id.strip(), "ligand": ligand.strip(), "mode": mode}
         try:
-            with st.spinner("Scoring..."):
+            with st.spinner("Analyzing Compatibility..."):
                 data = cached_predict(BASE_URL, payload)
-            st.metric("Score", f"{data.get('score')}")
-            exps = data.get("explanations", [])
-            if exps:
-                st.markdown("**Explanations**")
-                for e in exps:
-                    st.markdown(f"- {e}")
-            # Viewer from viewer_payload or fallback
-            vp = data.get("viewer_payload") or {}
-            sdf = vp.get("ligand_sdf") if isinstance(vp, dict) else None
-            render_mol(sdf or BENZENE_SDF, fmt="sdf", style=style)
+            
+            sc1, sc2 = st.columns([1, 2])
+            with sc1:
+                st.metric("Binding Compatibility", f"{data.get('binding_score')}%")
+            
+            with sc2:
+                # Property table
+                props = data.get("ligand_properties") or {}
+                if props:
+                    st.markdown("**Ligand Properties**")
+                    st.dataframe(pd.DataFrame([props]), hide_index=True)
+
+            col_ex, col_rec = st.columns(2)
+            with col_ex:
+                exps = data.get("explanations", [])
+                if exps:
+                    st.markdown("**Explanations**")
+                    for e in exps:
+                        st.markdown(f"- {e}")
+            
+            with col_rec:
+                recs = data.get("recommendations", [])
+                if recs:
+                    st.markdown("**Recommendations**")
+                    for r in recs:
+                        st.markdown(f"- {r}")
+            
             st.session_state["result_history"].append({"type": "score", "payload": payload, "result": data})
         except Exception as e:
             st.error(f"Scoring failed: {e}")
@@ -231,9 +228,6 @@ with docking_tab:
     with col2:
         style = st.selectbox("Pose style", ["stick", "cartoon", "surface"], index=0, key="dash_dock_style")
         spin = st.checkbox("Spin animation", value=False, key="dash_dock_spin")
-        also_mutate = st.checkbox("Also show Top-5 mutations", value=False, key="dash_dock_mutate")
-    # Optional protein PDB for visualization only (does not affect backend)
-    prot_pdb_for_view = st.file_uploader("Optional: load protein PDB for visualization only", type=["pdb"], key="dash_dock_prot_view")
     if st.button("Dock", type="primary", key="dash_dock_btn"):
         payload = {"protein_id": protein_id.strip(), "ligand": ligand.strip()}
         try:
@@ -245,173 +239,75 @@ with docking_tab:
                 st.subheader("Best docking result")
                 st.markdown(f"**Affinity:** `{aff} kcal/mol`  (more negative is better)")
             pose = data.get("pose")
-            if pose or prot_pdb_for_view is not None:
-                # Render combined scene if possible: protein (cartoon) + ligand pose (sticks)
+            if pose:
+                # Render ligand pose (sticks)
                 if py3Dmol is None:
                     st.info("py3Dmol is not installed. Run: pip install py3Dmol")
                 else:
                     view = py3Dmol.view(width=700, height=500)
-                    view.setBackgroundColor('0x00000000')
-                    # Protein first (if provided)
-                    if prot_pdb_for_view is not None:
+                    view.setBackgroundColor('0x00000000') # Transparent background
+                    
+                    # 1. Add Protein (Background - Muted)
+                    clean_pid = protein_id.strip()
+                    proj_root = Path(__file__).resolve().parents[2]
+                    prot_path = proj_root / "data" / "proteins" / f"{clean_pid}.pdb"
+                    if not prot_path.exists():
+                         prot_path = Path("data") / "proteins" / f"{clean_pid}.pdb"
+                    
+                    if prot_path.exists():
                         try:
-                            pdb_text = prot_pdb_for_view.getvalue().decode('utf-8', errors='ignore')
-                            view.addModel(pdb_text, 'pdb')
-                            view.setStyle({"cartoon": {"color": "spectrum"}})
-                        except Exception:
-                            st.warning("Failed to parse uploaded protein PDB for visualization.")
-                    # Ligand pose next (if available)
-                    if pose:
-                        try:
-                            view.addModel(pose, 'sdf')
-                            view.addStyle({}, {"stick": {"radius": 0.2}})
-                        except Exception:
-                            st.warning("Failed to parse ligand pose SDF for visualization.")
-                    view.zoomTo()
+                            view.addModel(prot_path.read_text(), "pdb")
+                            # Style: Muted Slate/Teal Cartoon, transparent
+                            view.setStyle({"model": -1}, {"cartoon": {"color": "#607d8b", "opacity": 0.6}})
+                        except Exception as e:
+                            st.warning(f"Could not load protein structure: {e}")
+                    else:
+                        st.warning(f"Protein file not found at {prot_path}")
+
+                    # 2. Add Ligand (Hero - High Contrast)
+                    try:
+                        view.addModel(pose, 'sdf')
+                        # Style: Thick sticks, CPK colors (Jmol), Carbon=Grayish
+                        view.setStyle({"model": -1}, {"stick": {"colorscheme": "Jmol", "radius": 0.3}})
+                    except Exception:
+                        st.warning("Failed to parse ligand pose SDF for visualization.")
+
+                    # 3. Highlight Binding Pocket (Midground - Context)
+                    # Select residues within 5 Angstroms of the ligand (model -1)
+                    ligand_sel = {"model": -1}
+                    pocket_sel = {"within": {"distance": 5, "sel": ligand_sel}}
+                    
+                    # Style 3.1: Semi-transparent surface for the pocket
+                    view.addSurface(py3Dmol.MS, {"opacity": 0.4, "color": "#81d4fa"}, pocket_sel)
+                    
+                    # Style 3.2: Detailed sticks for pocket residues (thinner than ligand)
+                    view.addStyle(pocket_sel, {"stick": {"radius": 0.1, "colorscheme": "chain"}})
+
+                    # 4. Interactions (Hydrogen Bonds)
+                    # Auto-calculate and draw H-bonds between ligand and everything else
+                    # view.addHydrogenBonds might be tricky in pure python-wrapper without JS callback, 
+                    # but simple invocation often works for standard residues.
+                    # We will rely on the pocket visual context as primary interaction cue.
+
+                    # 5. Camera & Animation
+                    view.zoomTo({"model": -1}) # Focus on Ligand/Pocket
+                    
                     if spin:
-                        try:
-                            view.spin(True)
-                        except Exception:
-                            pass
+                         view.spin(True)
+
                     try:
                         html_str = view.show()
                     except Exception:
                         html_str = view._make_html()
                     st_html(html_str, height=500, scrolling=False)
-                if pose:
-                    st.download_button(
-                        "Download pose SDF",
-                        data=pose.encode("utf-8"),
-                        file_name="pose.sdf",
-                        mime="chemical/x-mdl-sdfile",
-                    )
+                st.download_button(
+                    "Download pose SDF",
+                    data=pose.encode("utf-8"),
+                    file_name="pose.sdf",
+                    mime="chemical/x-mdl-sdfile",
+                )
             else:
                 st.info("No pose SDF available (tooling may be missing or conversion failed).")
-
-            # Optional: quick mutation search (top-5) under docking mode
-            if also_mutate:
-                st.divider()
-                st.subheader("Top-5 mutations (docking mode)")
-                imp_payload = {
-                    "protein_id": protein_id.strip(),
-                    "ligand_smiles": ligand.strip(),
-                    "target_score": 0,
-                    "mode": "docking",
-                    "n_iters": 2,
-                    "pop_size": 6,
-                    "mutate_rate": 0.5,
-                }
-                try:
-                    with st.spinner("Generating and scoring mutations..."):
-                        imp = cached_improve(BASE_URL, imp_payload)
-                    imps = (imp.get("improvements") or [])[:5]
-                    base = imp.get("base_score")
-
-                    def _mol_svg(smiles: str, size=(160, 120)):
-                        if not RD_OK or not smiles:
-                            return None
-                        try:
-                            m = Chem.MolFromSmiles(smiles)
-                            if not m:
-                                return None
-                            return Draw.MolsToGridImage([m], molsPerRow=1, subImgSize=size, useSVG=True)
-                        except Exception:
-                            return None
-
-                    if not imps:
-                        st.caption("No mutation improvements found.")
-                    else:
-                        for it in imps:
-                            s = it.get("smiles"); sc = float(it.get("score", 0.0))
-                            op = it.get("op_name") or "-"
-                            parent = it.get("parent_smiles")
-                            psc = base if parent is None else imp.get("trace", [{}])[0].get("score", base)
-                            # In docking mode: lower score (affinity) is better
-                            better = (psc is not None) and (sc < psc)
-                            delta = None if psc is None else (sc - psc)
-
-                            c1, c2, c3, c4 = st.columns([2, 2, 2, 1.2])
-                            with c1:
-                                svg = _mol_svg(s)
-                                if svg:
-                                    st.write(svg, unsafe_allow_html=True)
-                                else:
-                                    st.code(s)
-                            with c2:
-                                st.markdown(f"**Operation**: {op}")
-                                if parent:
-                                    psvg = _mol_svg(parent)
-                                    if psvg:
-                                        st.write(psvg, unsafe_allow_html=True)
-                                    else:
-                                        st.code(parent)
-                                else:
-                                    st.caption("Seed")
-                            with c3:
-                                st.markdown(f"**Parent**: `{parent or 'seed'}`")
-                                st.markdown(f"**Affinity**: `{sc}` kcal/mol")
-                            with c4:
-                                if delta is not None and psc is not None:
-                                    color = "#2e7d32" if better else "#c62828"
-                                    sign = ""  # for docking, negative delta is improvement
-                                    st.markdown(f"<div style='font-weight:700;color:{color}'>Δ {delta:.3f}</div>", unsafe_allow_html=True)
-                                else:
-                                    st.markdown("Δ n/a")
-                            st.divider()
-                    # Trace + tree for docking mutations
-                    trace2 = imp.get("trace", []) or []
-                    op_by_smiles = { (it.get("smiles") or ""): (it.get("op_name") or "") for it in imps if it.get("smiles") }
-                    rows = []
-                    for t in trace2:
-                        rows.append({
-                            "step": int(t.get("step", 0)),
-                            "smiles": t.get("smiles"),
-                            "score": float(t.get("score", 0.0)) if t.get("score") is not None else None,
-                            "operation": op_by_smiles.get(t.get("smiles") or "", "-"),
-                        })
-                    with st.expander("Trace (table)"):
-                        if rows:
-                            st.dataframe(pd.DataFrame(rows), width='stretch')
-                        else:
-                            st.caption("No trace returned by backend.")
-
-                    with st.expander("Mutation tree"):
-                        if not GV_OK:
-                            st.info("graphviz not installed. Run: pip install graphviz")
-                        else:
-                            dot = graphviz.Digraph()
-                            seed = ligand.strip()
-                            def node_label(sm: str) -> str:
-                                if not sm:
-                                    return "?"
-                                sc = None
-                                for r in rows:
-                                    if r["smiles"] == sm and r.get("score") is not None:
-                                        sc = r["score"]
-                                        break
-                                return f"{sm[:12]}…\n{sc:.3f}" if sc is not None else (sm[:12] + ("…" if len(sm) > 12 else ""))
-                            dot.node("seed", node_label(seed), shape="box")
-                            added = {seed}
-                            for it in imps:
-                                s = it.get("smiles"); p = it.get("parent_smiles"); op = it.get("op_name") or ""
-                                if not s:
-                                    continue
-                                sid = f"n{abs(hash(s))%10**8}"
-                                if s not in added:
-                                    dot.node(sid, node_label(s))
-                                    added.add(s)
-                                if p:
-                                    pid = "seed" if p == seed else f"n{abs(hash(p))%10**8}"
-                                    if p not in added:
-                                        dot.node(pid, node_label(p))
-                                        added.add(p)
-                                    dot.edge(pid, sid, label=op)
-                                else:
-                                    dot.edge("seed", sid, label=op)
-                            st.graphviz_chart(dot)
-                except Exception as e:
-                    st.warning(f"Mutation scoring failed: {e}")
-            st.session_state["result_history"].append({"type": "dock", "payload": payload, "result": data})
         except Exception as e:
             st.error(f"Docking failed: {e}")
 
@@ -422,21 +318,23 @@ with improvement_tab:
         protein_id = st.text_input("Protein ID", value="1ABC", key="dash_imp_pid")
         ligand = st.text_input("Ligand SMILES", value="CCO", key="dash_imp_smi")
     with col2:
-        target = st.number_input("Target score", value=80, min_value=1, max_value=100, step=1, key="dash_imp_target")
-        mode = st.selectbox("Mode", ["heuristic", "docking", "ml"], index=0, key="dash_imp_mode")
-        quick = st.checkbox("Quick mode (docking)", value=False, key="dash_imp_quick")
+        mode = st.selectbox("Mode", ["heuristic", "docking"], index=1, key="dash_imp_mode", help="Heuristic uses fast descriptors; Docking uses AutoDock Vina for precise affinity.")
+    with col2:
+        if mode == "docking":
+            target = st.number_input("Target affinity (kcal/mol)", value=-8.0, max_value=0.0, step=0.1, key="dash_imp_target", help="Lower is better. Optimization stops if reached.")
+        else:
+            target = st.number_input("Target score (0-100)", value=80, min_value=1, max_value=100, step=1, key="dash_imp_target", help="Higher is better.")
     if st.button("Run improvement", type="primary", key="dash_imp_btn"):
         payload = {"protein_id": protein_id.strip(), "ligand_smiles": ligand.strip(), "target_score": int(target)}
         # Use advanced optimizer when user selects a mode or quick
         if mode:
             payload.update({"mode": mode})
-        if quick:
-            payload.update({"size": [18.0, 18.0, 18.0]})  # hint quick to backend
         try:
             with st.spinner("Optimizing..."):
                 data = cached_improve(BASE_URL, payload)
             base_score = data.get("base_score")
-            st.markdown(f"**Base score:** `{base_score}`")
+            unit = " kcal/mol" if mode == "docking" else ""
+            st.markdown(f"**Base score:** `{base_score}`{unit}")
 
             imps = data.get("improvements", [])
             trace = data.get("trace", [])
@@ -499,18 +397,28 @@ with improvement_tab:
 
             # Table with previews and colored delta
             st.markdown("**Top candidates**")
+            if "debug_info" in data and data["debug_info"]:
+                with st.expander("Debug Info (Developer)"):
+                    st.json(data["debug_info"])
+                    st.write("Raw Base Score:", data.get("base_score"))
             if not imps:
                 st.info("No improvements found.")
             else:
                 for it in imps:
                     s = it.get("smiles"); sc = float(it.get("score", 0.0))
-                    op = it.get("op_name") or "-"
+                    # Priority: mutation_description -> op_name -> "-"
+                    op = it.get("mutation_description") or it.get("op_name") or "-"
                     parent = it.get("parent_smiles")
                     psc = score_by_smiles.get(parent, base_score)
+                    
                     # Determine improvement direction by mode
                     run_mode = (data.get("run_metadata", {}) or {}).get("mode", mode)
                     better = (sc < psc) if run_mode == "docking" else (sc > psc)
-                    delta = None if psc is None else (sc - psc)
+                    
+                    # Priority: delta_affinity from backend -> calculated delta
+                    delta = it.get("delta_affinity")
+                    if delta is None and psc is not None:
+                        delta = sc - psc
 
                     c1, c2, c3, c4 = st.columns([2, 2, 2, 1.2])
                     with c1:
@@ -531,12 +439,17 @@ with improvement_tab:
                             st.caption("Seed")
                     with c3:
                         st.markdown(f"**Parent**: `{parent or 'seed'}`")
-                        st.markdown(f"**Score**: `{sc}`")
+                        unit = " kcal/mol" if run_mode == "docking" else ""
+                        st.markdown(f"**Score**: `{sc}`{unit}")
                     with c4:
                         if delta is not None:
                             color = "#2e7d32" if better else "#c62828"
-                            sign = "+" if (delta >= 0 and run_mode != "docking") or (delta < 0 and run_mode == "docking") else ""
-                            st.markdown(f"<div style='font-weight:700;color:{color}'>Δ {sign}{delta:.3f}</div>", unsafe_allow_html=True)
+                            # For docking, negative delta is improvement.
+                            # For heuristic, positive delta is improvement.
+                            # We show '+' if it's an 'increase' in heuristic or 'worse' in docking?
+                            # Actually, just show the delta sign from backend.
+                            sign = "+" if (float(delta) > 0) else ""
+                            st.markdown(f"<div style='font-weight:700;color:{color}'>Δ {sign}{delta:.2f}</div>", unsafe_allow_html=True)
                         else:
                             st.markdown("Δ n/a")
                     st.divider()
@@ -591,6 +504,13 @@ with improvement_tab:
                         else:
                             dot.edge("seed", sid, label=op)
                     st.graphviz_chart(dot)
+                    st.download_button(
+                        "Download Mutation Tree (DOT)",
+                        data=dot.source,
+                        file_name="mutation_tree.dot",
+                        mime="text/vnd.graphviz",
+                        key="dash_imp_dot_dl"
+                    )
             st.session_state["result_history"].append({"type": "improve", "payload": payload, "result": data})
         except Exception as e:
             st.error(f"Improvement failed: {e}")

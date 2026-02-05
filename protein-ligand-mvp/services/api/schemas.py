@@ -82,6 +82,9 @@ class PredictOut(BaseModel):
     calibration_info: str
     explanations: List[str]
     viewer_payload: Optional[ViewerPayload] = None
+    binding_score: Optional[float] = None
+    ligand_properties: Optional[Dict[str, float]] = None
+    recommendations: Optional[List[str]] = None
 
 
 class ImproveIn(BaseModel):
@@ -103,6 +106,8 @@ class ImprovedMolecule(BaseModel):
     smiles: str
     score: float
     step: int
+    delta_affinity: Optional[float] = None
+    mutation_description: Optional[str] = None
     op_name: Optional[str] = None
     parent_smiles: Optional[str] = None
     explanations: Optional[List[str]] = None
@@ -118,8 +123,9 @@ class TraceItem(BaseModel):
 class ImproveOut(BaseModel):
     base_score: float
     improvements: List[ImprovedMolecule]
-    trace: List[TraceItem]
+    trace: List[dict]
     run_metadata: Optional[Dict[str, Any]] = None
+    debug_info: Optional[Dict[str, Any]] = None
 
 
 # Protein upload response models

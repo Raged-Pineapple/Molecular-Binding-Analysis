@@ -410,52 +410,67 @@ def evaluate_candidates(smiles_list: List[str], protein_path: str | None = None,
     return out
 
 
-def genetic_optimize(
-    smiles: str,
-    protein_path: str | None = None,
-    n_iters: int = 5,
-    pop_size: int = 6,
-    target_score: float | None = None,
-    quick: bool = False,
-):
-    """Simple GA-style loop over mutations with deterministic operators.
-    Returns a dict with final sorted population and a trace of steps.
-    """
-    # Initialize population with seed and its immediate mutants
-    pop: List[str] = [smiles]
-    pop += mutate_smiles(smiles)
-    pop = list(dict.fromkeys(pop))  # stable unique
+def docking_driven_improve(seed_smiles: str, protein_id: str) -> Dict[str, Any]:
+    """Generates improved ligands for a protein using docking affinity as the signal."""
+    # 1. Resolve Protein
+    protein_path = Path("data") / "proteins" / f"{protein_id}.pdb"
+    if not protein_path.exists():
+        raise FileNotFoundError(f"Protein {protein_id} not found.")
 
-    scored = evaluate_candidates(pop, protein_path, quick=quick)
-    dock_mode = bool(protein_path)
-    scored.sort(key=lambda x: x[1], reverse=not dock_mode)
-    scored = scored[:pop_size]
-    trace: List[dict] = [
-        {"step": 0, "smiles": s, "score": sc} for s, sc in scored
-    ]
+    # 2. Get Base Affinity
+    base_res = _docking.dock(seed_smiles, str(protein_path))
+    base_affinity = base_res.get("affinity")
+    if base_affinity is None:
+        raise ValueError("Could not establish base affinity for docking.")
 
-    for i in range(1, n_iters + 1):
-        # Mutate current population
-        new_pool: List[str] = [s for s, _ in scored]
-        for s, _ in scored:
-            new_pool.extend(mutate_smiles(s))
-        # Unique
-        new_pool = list(dict.fromkeys(new_pool))
+    # 3. Generate Mutations (Limit to ~10 unique mutations)
+    # We use a subset of operators to stay within limits and ensure scientific relevance
+    mutants_with_ops = generate_mutants(seed_smiles, n_per_operator=1)
+    # Filter to top 10 unique mutants if we have more
+    mutants_with_ops = mutants_with_ops[:10]
 
-        # Score
-        new_scored = evaluate_candidates(new_pool, protein_path, quick=quick)
-        new_scored.sort(key=lambda x: x[1], reverse=not dock_mode)
-        scored = new_scored[:pop_size]
-        for s, sc in scored:
-            trace.append({"step": i, "smiles": s, "score": sc})
+    improvements = []
+    seen_smiles = {seed_smiles}
 
-        # Early stop
-        if target_score is not None:
-            if dock_mode and any(sc <= target_score for _, sc in scored):
-                break
-            if (not dock_mode) and any(sc >= target_score for _, sc in scored):
-                break
+    # 4. Dock each mutant against the SAME protein
+    for mut_smiles, op_name in mutants_with_ops:
+        if mut_smiles in seen_smiles:
+            continue
+        seen_smiles.add(mut_smiles)
 
-    # Return final sorted list and trace
-    final_list = [{"smiles": s, "score": sc, "step": i} for i, (s, sc) in enumerate(scored, start=0)]
-    return {"final": final_list, "trace": trace}
+        try:
+            # Use quick=True for inner-loop docking to speed up improvement
+            res = _docking.dock(mut_smiles, str(protein_path), quick=True)
+            aff = res.get("affinity")
+            if aff is None:
+                continue
+            
+            # 5. Selection Logic: mutant_affinity < base_affinity (and >= 0.3 kcal/mol improvement)
+            delta = float(aff) - float(base_affinity)
+            if delta <= -0.3:
+                improvements.append({
+                    "smiles": mut_smiles,
+                    "score": float(aff),
+                    "affinity": float(aff),
+                    "delta_affinity": round(delta, 2),
+                    "mutation_description": op_name.replace("_", " ").title(),
+                    "op_name": op_name,
+                    "step": 1
+                })
+        except Exception as e:
+            log.warning(f"Failed to dock mutant {mut_smiles}: {e}")
+            continue
+
+    # 6. Ranking: Sort by affinity (lowest first)
+    improvements.sort(key=lambda x: x["affinity"])
+    
+    # Return top 5
+    top_improvements = improvements[:5]
+
+    return {
+        "base_score": float(base_affinity),
+        "base_affinity": float(base_affinity),
+        "improvements": top_improvements,
+        "trace": [{"step": 0, "smiles": seed_smiles, "score": float(base_affinity)}] + 
+                 [{"step": 1, "smiles": x["smiles"], "score": x["score"]} for x in top_improvements]
+    }
